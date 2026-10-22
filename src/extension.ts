@@ -782,6 +782,8 @@ const SYSTEM_PROMPT = _loadPrompt('system.md');
 /* v2.89.64 — AgentDef interface, AGENTS map, AGENT_ORDER, SPECIALIST_IDS
    moved to src/agents.ts. extension.ts only imports them now. ~118 lines saved. */
 import { AgentDef, AGENTS, AGENT_ORDER, SPECIALIST_IDS } from './agents';
+import { joinPlaza, postPlazaMessage, setPlazaDbUrl, plazaConfigured, PlazaSession, PlazaMessage } from './plaza';
+let _plazaSession: PlazaSession | null = null; // 🏛️ 광장 입장 세션(토글)
 
 // ───────────────────────────────────────────────────────────────────────────
 // Connected campus world (Phase B-1 — multi-zone layout).
@@ -8977,6 +8979,65 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('connect-ai-lab.openOffice', () => {
             OfficePanel.createOrShow(context, provider);
+        }),
+        /* 🏛️ 에이전트 광장 입장/퇴장 (Layer 2 — EZERAI 웹과 GCP RTDB 공유).
+           우리 비서가 광장에 입장해 다른 회사 비서들과 실시간 대화한다. 토글 명령. */
+        vscode.commands.registerCommand('connect-ai-lab.enterPlaza', async () => {
+            if (_plazaSession) {
+                _plazaSession.stop(); _plazaSession = null;
+                vscode.window.showInformationMessage('🏛️ 광장에서 퇴장했습니다.');
+                return;
+            }
+            const cfg = vscode.workspace.getConfiguration('connectAiLab');
+            let dbUrl = (cfg.get<string>('plazaDbUrl') || process.env.PLAZA_DB_URL || '').trim();
+            setPlazaDbUrl(dbUrl);
+            if (!plazaConfigured()) {
+                const pick = await vscode.window.showInputBox({
+                    title: '에이전트 광장 — Firebase Realtime Database URL',
+                    prompt: 'GCP Firebase RTDB URL을 입력하세요 (EZERAI와 동일 DB).',
+                    placeHolder: 'https://<your-db>-default-rtdb.firebaseio.com',
+                });
+                if (!pick) return;
+                dbUrl = pick.trim();
+                await cfg.update('plazaDbUrl', dbUrl, vscode.ConfigurationTarget.Global);
+                setPlazaDbUrl(dbUrl);
+            }
+            let uid = context.globalState.get<string>('plazaUid');
+            if (!uid) { uid = 'ca-' + Math.random().toString(36).slice(2, 9); await context.globalState.update('plazaUid', uid); }
+            const company = readCompanyName() || '1인 기업';
+            const emoji = '🖥️';
+            const agents = ['📺', '📸', '🎨', '💻', '📊', '🗂️', '✂️', '✍️', '🔍'];
+
+            // 비서 발화에 쓸 모델 해석 (설정값 → 없으면 엔진에서 첫 모델 자동 감지)
+            let modelName = getConfig().defaultModel;
+            if (!modelName) {
+                try {
+                    const { ollamaBase } = getConfig();
+                    if (_isLMStudioEngine(ollamaBase)) {
+                        const r = await axios.get(`${ollamaBase}/v1/models`, { timeout: 1500 });
+                        modelName = r.data?.data?.[0]?.id || '';
+                    } else {
+                        const r = await axios.get(`${ollamaBase}/api/tags`, { timeout: 1500 });
+                        modelName = r.data?.models?.[0]?.name || '';
+                    }
+                } catch { /* 모델 자동 감지 실패는 무시 — 비서 발화만 빈 값 */ }
+            }
+
+            let lastReplyAt = 0; // 비서끼리 무한 핑퐁 방지용 쿨다운
+            _plazaSession = joinPlaza(
+                { uid, company, emoji, agents, source: 'connect-ai' },
+                async (m: PlazaMessage) => {
+                    vscode.window.setStatusBarMessage(`🏛️ ${m.emoji} ${m.company}: ${m.text}`, 6000);
+                    const now = Date.now();
+                    if (now - lastReplyAt < 12000) return; // 12s 쿨다운
+                    lastReplyAt = now;
+                    const line = await provider.generateSecretaryLine(m, modelName);
+                    if (line) await postPlazaMessage({ uid: uid!, company, emoji, role: 'secretary', text: line }).catch(() => {});
+                },
+            );
+            vscode.window.showInformationMessage(`🏛️ ${company}(으)로 광장에 입장. 다시 실행하면 퇴장합니다.`);
+            const hello = await provider.generateSecretaryLine(null, modelName);
+            if (hello) await postPlazaMessage({ uid, company, emoji, role: 'secretary', text: hello }).catch(() => {});
         }),
         /* v2.89.96 — 사이드바 ⋯ 메뉴가 어떤 이유로 클릭 안 받을 때를 대비한
            명령 팔레트 fallback. Cmd/Ctrl+Shift+P → "Connect AI: 설정 열기" */
@@ -20423,21 +20484,56 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 post({ type: 'error', value: '🛑 사용자가 중단했어요.' });
                 return;
             }
-            // 4.5) 에이전트 간 자율 대화 (Confer) — 2명 이상일 때만
+            // 4.5) 에이전트 간 자율 대화 (Confer) — 진짜 멀티턴 LLM 왕복 (v2.89.158)
+            //   이전: CEO가 confer.md로 가짜 대화 1회를 통째로 생성.
+            //   지금: 참여한 specialist들이 각자 자기 페르소나로, 동료 산출물과
+            //   지금까지의 대화록을 보고 실제로 한 마디씩 in-character로 응답한다.
+            //   → LLM 호출이 턴마다 1번씩 발생하는 '진짜' 회의. (Layer 1)
             const conferTurns: { from: string; to: string; text: string }[] = [];
             if (plan.tasks.length >= 2) {
                 try {
-                    const conferInput = `[원 명령]\n${prompt}\n\n[산출물 요약]\n${plan.tasks.map(t => `\n## ${AGENTS[t.agent]?.name}\n${(outputs[t.agent] || '').slice(0, 800)}`).join('\n')}`;
-                    const conferRaw = await this._callAgentLLM(_personalizePrompt(CONFER_PROMPT), conferInput, modelName, 'ceo', false);
-                    const m = conferRaw.match(/\{[\s\S]*\}/);
-                    const parsed = JSON.parse(m ? m[0] : conferRaw);
-                    if (parsed && Array.isArray(parsed.turns)) {
-                        const validIds = SPECIALIST_IDS;
-                        for (const t of parsed.turns) {
-                            if (typeof t.from === 'string' && typeof t.to === 'string' && typeof t.text === 'string'
-                                && validIds.includes(t.from) && validIds.includes(t.to)
-                                && t.from !== t.to && t.text.trim().length > 0) {
-                                conferTurns.push({ from: t.from, to: t.to, text: t.text.trim().slice(0, 80) });
+                    // 산출물이 실제로 있는 specialist만 회의 참가
+                    const parts = plan.tasks
+                        .map(t => t.agent)
+                        .filter(id => SPECIALIST_IDS.includes(id) && (outputs[id] || '').trim().length > 30);
+                    if (parts.length >= 2) {
+                        // 발언 스케줄: 인접 동료에게 말 걸고 → 답하기. 최소 3턴, 최대 5턴.
+                        const schedule: { from: string; to: string }[] = [];
+                        for (let i = 0; i < parts.length - 1 && schedule.length < 5; i++) {
+                            schedule.push({ from: parts[i], to: parts[i + 1] });
+                            if (schedule.length < 5) schedule.push({ from: parts[i + 1], to: parts[i] });
+                        }
+                        if (parts.length === 2 && schedule.length < 3) schedule.push({ from: parts[0], to: parts[1] });
+
+                        post({ type: 'response', value: '💬 팀이 자리에서 자율 회의를 시작합니다…' });
+                        const outSummary = (id: string) => (outputs[id] || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+
+                        for (const turn of schedule) {
+                            if (isAborted()) break;
+                            const fromA = AGENTS[turn.from], toA = AGENTS[turn.to];
+                            if (!fromA || !toA) continue;
+                            const transcript = conferTurns.length
+                                ? conferTurns.map(t => `${AGENTS[t.from]?.name}: ${t.text}`).join('\n')
+                                : '(아직 대화 없음 — 네가 먼저 말을 건다)';
+                            const conferUser =
+                                `[팀 회의 — 너는 ${fromA.name}]\n` +
+                                `원 명령: ${prompt}\n\n` +
+                                `너의 산출물 요약:\n${outSummary(turn.from)}\n\n` +
+                                `${toA.name}의 산출물 요약:\n${outSummary(turn.to)}\n\n` +
+                                `지금까지의 대화:\n${transcript}\n\n` +
+                                `이제 ${toA.name}에게 한 마디 건네라. 두 산출물을 잇는 협업·확인·피드백이 드러나게. ` +
+                                `일반론·인사 금지. 반드시 한국어 한 문장, 40자 이내, ` +
+                                `따옴표·이름표·머리말 없이 '대사만' 출력.`;
+                            let line = '';
+                            try {
+                                const raw = await this._callAgentLLM(buildSpecialistPrompt(turn.from), conferUser, modelName, turn.from, false);
+                                line = (raw || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+                                line = line.replace(/^["'「『]+|["'」』]+$/g, '').replace(/^[-•*]\s*/, '').replace(/^[^:：]{1,12}[:：]\s*/, '').trim().slice(0, 80);
+                            } catch { /* 이 턴 실패는 skip — 회의 전체를 깨지 않음 */ }
+                            if (line) {
+                                conferTurns.push({ from: turn.from, to: turn.to, text: line });
+                                // 진행 상황을 즉시 흘려서 사용자가 회의가 도는 걸 체감
+                                post({ type: 'response', value: `💬 ${fromA.emoji} ${fromA.name} → ${toA.emoji} ${toA.name}: ${line}` });
                             }
                         }
                     }
@@ -20670,6 +20766,25 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                눌러야 풀리는 사고. 어떤 경로로 끝나든 finally에서 streamEnd 보장. */
             try { this._view?.webview.postMessage({ type: 'streamEnd' }); } catch { /* ignore */ }
         }
+    }
+
+    /* 🏛️ 광장(Plaza) — 비서가 회사를 대표해 광장에서 한 마디 생성.
+       다른 회사 비서의 발언(incoming)에 우리 회사 입장으로 응답. 로컬 모델 사용.
+       반환: 한국어 한 문장(≤60자). 실패 시 빈 문자열. */
+    public async generateSecretaryLine(incoming: PlazaMessage | null, modelName: string): Promise<string> {
+        const company = readCompanyName() || '우리 회사';
+        const ctx = incoming
+            ? `방금 ${incoming.company}의 비서가 광장에서 말했다:\n"${incoming.text}"\n\n여기에 ${company}의 비서로서 한 마디로 응답하라.`
+            : `${company}의 비서로서 광장에 모인 다른 회사들에게 먼저 인사 겸 한 마디를 건네라.`;
+        const usr =
+            `[에이전트 광장 — 여러 AI 회사의 비서들이 모인 공용 공간]\n${ctx}\n\n` +
+            `규칙: 한국어 한 문장, 60자 이내. 협업·관심·제안이 드러나게. ` +
+            `따옴표·이름표·머리말 없이 대사만 출력.`;
+        try {
+            const raw = await this._callAgentLLM(buildSpecialistPrompt('secretary'), usr, modelName, 'secretary', false);
+            let line = (raw || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+            return line.replace(/^["'「『]+|["'」』]+$/g, '').replace(/^[-•*]\s*/, '').trim().slice(0, 120);
+        } catch { return ''; }
     }
 
     // 단일 에이전트 LLM 호출. broadcast=true이면 토큰을 webview로 스트리밍.

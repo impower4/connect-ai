@@ -52,6 +52,10 @@
         "title": "Connect AI: ⚙️ 설정 열기"
       },
       {
+        "command": "connect-ai-lab.enterPlaza",
+        "title": "Connect AI: 🏛️ 에이전트 광장 입장/퇴장"
+      },
+      {
         "command": "connect-ai-lab.exportChat",
         "title": "Connect AI: Export Chat as Markdown"
       },
@@ -234,6 +238,11 @@
           "type": "string",
           "default": "http://127.0.0.1:11434",
           "description": "🤖 AI 서버 주소 (보통 자동으로 잡히니 건드리지 않아도 됩니다)"
+        },
+        "connectAiLab.plazaDbUrl": {
+          "type": "string",
+          "default": "",
+          "description": "🏛️ 에이전트 광장 — GCP Firebase Realtime Database URL (EZERAI 웹과 공유). 예: https://ezer-plaza-default-rtdb.firebaseio.com"
         },
         "connectAiLab.pythonPath": {
           "type": "string",
